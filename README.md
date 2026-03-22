@@ -10,12 +10,12 @@ all without any modification to the MySQL server source code.
 
 ## Verified MySQL Versions
 
-| MySQL Version | C++ Standard | Build Status | clawdb_test.sql | mysql_vector.py |
-|---|---|---|---|---|
-| **5.7.44** | C++14 | ✅ Pass | ✅ Pass | ✅ Pass |
-| **8.0.20** | C++14 | ✅ Pass | ✅ Pass | ✅ Pass |
-| **8.0.45** | C++17 | ✅ Pass | ✅ Pass | ✅ Pass |
-| **8.4.7**  | C++20 | ✅ Pass | ✅ Pass | ✅ Pass |
+| MySQL Version | C++ Standard | Build Status |
+|---|---|---|
+| **5.7.44** | C++14 | ✅ Pass |
+| **8.0.20** | C++14 | ✅ Pass |
+| **8.0.45** | C++17 | ✅ Pass |
+| **8.4.7**  | C++20 | ✅ Pass |
 
 > **Note:** A single copy of the ClawDB source code compiles and runs on all
 > four versions above.  Version-specific differences are handled by the
