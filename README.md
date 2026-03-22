@@ -251,29 +251,6 @@ Parameters (aligned with PGVector defaults):
 
 ---
 
-## File Structure
-
-```
-storage/clawdb/
-├── CMakeLists.txt      — Build rules (MYSQL_ADD_PLUGIN, C++ std selection)
-├── clawdb_compat.h     — Version compatibility layer (all #if VERSION here)
-├── ha_clawdb.h         — Handler class declaration
-├── ha_clawdb.cc        — Handler implementation + plugin registration
-├── clawdb_vec.h        — Vector type, distance function declarations
-├── clawdb_vec.cc       — Vector parse/serialize/distance implementation
-├── clawdb_hnsw.h       — HNSW index interface
-├── clawdb_hnsw.cc      — HNSW algorithm (ported from PGVector)
-├── clawdb_store.h      — Row storage interface
-├── clawdb_store.cc     — Row storage implementation (flat file)
-├── clawdb_udf.h        — UDF function declarations
-├── clawdb_udf.cc       — UDF implementations
-├── README.md           — This file
-└── test/
-    └── clawdb_test.sql — SQL functional test suite (13 test sections)
-```
-
----
-
 ## Test Suite
 
 ### clawdb_test.sql
@@ -301,7 +278,7 @@ It covers 13 test sections:
 
 ```bash
 # MySQL 8.0+ (UDFs auto-registered)
-mysql -u root -p < storage/clawdb/test/clawdb_test.sql
+mysql -u root -p < test/clawdb_test.sql
 
 # MySQL 5.7 (register UDFs first, then run)
 mysql -u root -p -e "
@@ -309,18 +286,10 @@ mysql -u root -p -e "
   CREATE FUNCTION clawdb_to_vector   RETURNS STRING SONAME 'ha_clawdb.so';
   CREATE FUNCTION clawdb_from_vector RETURNS STRING SONAME 'ha_clawdb.so';
 "
-mysql -u root -p < storage/clawdb/test/clawdb_test.sql
+mysql -u root -p < test/clawdb_test.sql
 ```
 
 Expected final output: `ClawDB test suite completed successfully.`
-
-### mysql_vector.py
-
-An end-to-end Python integration test that uses the Qwen3-Embedding-4B model
-to generate real embeddings, inserts them into a ClawDB table, and performs
-semantic KNN search with cosine distance.
-
-**Dependencies:** `pymysql`, `sentence-transformers`, `tqdm`
 
 ---
 
