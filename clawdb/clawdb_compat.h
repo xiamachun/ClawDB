@@ -165,4 +165,87 @@ namespace dd { class Table; }
 
 #define CLAWDB_HAS_UDF_REGISTRY (MYSQL_VERSION_ID >= 80000)
 
+/* -----------------------------------------------------------------------
+   11. KEY::comment type: 8.0+ uses LEX_CSTRING, 5.7 uses LEX_STRING.
+       Both have .str and .length members, but the const-ness differs.
+       We provide a uniform accessor macro for portability.
+   ----------------------------------------------------------------------- */
+
+#if MYSQL_VERSION_ID >= 80000
+#define CLAWDB_KEY_COMMENT_STR(key)  ((key).comment.str)
+#define CLAWDB_KEY_COMMENT_LEN(key)  ((key).comment.length)
+#else
+#define CLAWDB_KEY_COMMENT_STR(key)  ((key).comment.str)
+#define CLAWDB_KEY_COMMENT_LEN(key)  ((key).comment.length)
+#endif
+
+/* -----------------------------------------------------------------------
+   12. bas_ext(): required as a pure virtual override on 5.7 only.
+       On 8.0+ the base class provides a default implementation.
+   ----------------------------------------------------------------------- */
+
+#if MYSQL_VERSION_ID < 80000
+#define CLAWDB_BAS_EXT_OVERRIDE                                 \
+  const char **bas_ext() const override {                       \
+    static const char *empty[] = {NullS};                       \
+    return empty;                                               \
+  }
+#else
+#define CLAWDB_BAS_EXT_OVERRIDE
+#endif
+
+/* -----------------------------------------------------------------------
+   13. Index algorithm overrides: 8.0+ requires get_default_index_algorithm()
+       and is_index_algorithm_supported().  These do not exist on 5.7.
+   ----------------------------------------------------------------------- */
+
+#if MYSQL_VERSION_ID >= 80000
+#define CLAWDB_INDEX_ALGORITHM_OVERRIDES                                     \
+  enum ha_key_alg get_default_index_algorithm() const override {             \
+    return HA_KEY_ALG_HASH;                                                  \
+  }                                                                          \
+  bool is_index_algorithm_supported(enum ha_key_alg key_alg) const override {\
+    return key_alg == HA_KEY_ALG_HASH;                                       \
+  }
+#else
+#define CLAWDB_INDEX_ALGORITHM_OVERRIDES
+#endif
+
+/* -----------------------------------------------------------------------
+   14. Field pointer access: field_ptr() was added in 8.0.25; earlier
+       versions expose the raw 'ptr' member directly.
+   ----------------------------------------------------------------------- */
+
+#if MYSQL_VERSION_ID >= 80025
+#define CLAWDB_FIELD_PTR(field)  ((field)->field_ptr())
+#else
+#define CLAWDB_FIELD_PTR(field)  ((field)->ptr)
+#endif
+
+/* -----------------------------------------------------------------------
+   15. Field_blob data access: 8.0+ provides get_blob_data() returning
+       const uchar*; 5.7 uses get_ptr(uchar**) instead.
+
+       Note: we cannot use an inline function here because clawdb_compat.h
+       does not include sql/field.h (and must not, to avoid circular
+       dependencies).  The helper function is defined in ha_clawdb.cc
+       where Field_blob is fully declared.
+   ----------------------------------------------------------------------- */
+
+#define CLAWDB_HAS_GET_BLOB_DATA (MYSQL_VERSION_ID >= 80000)
+
+/* -----------------------------------------------------------------------
+   16. down_cast<>: MySQL 8.0+ provides down_cast in my_dbug.h;
+       5.7 does not.  Provide a simple fallback using static_cast.
+   ----------------------------------------------------------------------- */
+
+#if MYSQL_VERSION_ID < 80000
+#ifndef down_cast
+template <typename To, typename From>
+inline To down_cast(From *from) {
+  return static_cast<To>(from);
+}
+#endif
+#endif
+
 #endif  /* STORAGE_CLAWDB_CLAWDB_COMPAT_H */

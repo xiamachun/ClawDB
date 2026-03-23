@@ -57,10 +57,8 @@
 #include "ha_clawdb.h"
 
 #include <cerrno>
-#include <cstdio>
 #include <cstring>
 #include <string>
-#include <unordered_map>
 
 /* MySQL server headers */
 #include "my_dbug.h"
@@ -70,72 +68,61 @@
 #include "sql/sql_class.h"
 #include "sql/table.h"
 
-/* ClawDB headers */
-#include "clawdb_udf.h"
-#include "clawdb_vec.h"
-
 /* -----------------------------------------------------------------------
-   Version-portable field helpers (declared in ha_clawdb.h)
+   apply_hnsw_index_params: scan KEY definitions for HNSW COMMENT
    ----------------------------------------------------------------------- */
 
-bool is_blob_field(const Field *field) {
-  const enum_field_types field_type = field->type();
-  return field_type == MYSQL_TYPE_BLOB ||
-         field_type == MYSQL_TYPE_MEDIUM_BLOB ||
-         field_type == MYSQL_TYPE_LONG_BLOB ||
-         field_type == MYSQL_TYPE_TINY_BLOB;
+void ha_clawdb::apply_hnsw_index_params() {
+  if (table == nullptr || share_ == nullptr) return;
+
+  ClawdbHnswParams params;
+
+  /* Scan all keys looking for a secondary index on a BLOB column
+     whose COMMENT contains HNSW parameters. */
+  for (uint key_idx = 0; key_idx < table->s->keys; ++key_idx) {
+    KEY *key_info = table->key_info + key_idx;
+
+    /* Skip PRIMARY KEY — we only care about secondary indexes. */
+    if (key_info->flags & HA_NOSAME) continue;
+
+    /* Check if this key covers a BLOB field. */
+    bool covers_blob = false;
+    for (uint part_idx = 0; part_idx < key_info->user_defined_key_parts;
+         ++part_idx) {
+      Field *field = key_info->key_part[part_idx].field;
+      if (is_blob_field(field)) {
+        covers_blob = true;
+        break;
+      }
+    }
+
+    if (!covers_blob) continue;
+
+    /* Found a secondary index on a BLOB column.  Parse its COMMENT. */
+    const char *comment_str = CLAWDB_KEY_COMMENT_STR(*key_info);
+    size_t comment_len = CLAWDB_KEY_COMMENT_LEN(*key_info);
+
+    if (comment_str != nullptr && comment_len > 0) {
+      clawdb_parse_hnsw_comment(comment_str, comment_len, &params);
+    } else {
+      /* Secondary index on BLOB without COMMENT: treat as HNSW with defaults. */
+      params.has_vector_index = true;
+    }
+    break;  /* Only one vector index per table is supported. */
+  }
+
+  /* Apply parsed parameters to the share. */
+  share_->hnsw_params = params;
+
+  if (params.has_vector_index && !share_->hnsw) {
+    /* Create the HNSW index only if one does not already exist.
+       Subsequent open() calls on the same share must not replace a
+       populated index with an empty one — rebuild_hnsw_index() is
+       called exactly once after the data file is first opened. */
+    share_->hnsw = std::make_unique<ClawdbHnswIndex>(
+        params.m, params.ef_construction, params.ef_search, params.metric);
+  }
 }
-
-uchar *clawdb_field_ptr(Field *field) {
-#if MYSQL_VERSION_ID >= 80025
-  return field->field_ptr();
-#else
-  return field->ptr;
-#endif
-}
-
-/**
-  Read the raw data pointer from a BLOB field, portably across MySQL versions.
-
-  MySQL 8.0+ provides Field_blob::get_blob_data() which returns const uchar*.
-  MySQL 5.7 uses Field_blob::get_ptr(uchar**) instead.
-
-  @param[in]  blob_field  The BLOB field to read from.
-  @return Pointer to the BLOB data, or nullptr if empty.
-*/
-static const uchar *clawdb_get_blob_data(Field_blob *blob_field) {
-#if MYSQL_VERSION_ID >= 80000
-  return blob_field->get_blob_data();
-#else
-  uchar *ptr = nullptr;
-  blob_field->get_ptr(&ptr);
-  return ptr;
-#endif
-}
-
-/* -----------------------------------------------------------------------
-   Global share registry
-   ----------------------------------------------------------------------- */
-
-/** Protects the global share map. */
-static std::mutex global_share_mutex;
-
-/** Maps table_name -> ClawdbShare*. */
-static std::unordered_map<std::string, ClawdbShare *> global_share_map;
-
-/* -----------------------------------------------------------------------
-   ClawdbShare
-   ----------------------------------------------------------------------- */
-
-ClawdbShare::ClawdbShare(const std::string &name) : table_name(name) {
-  thr_lock_init(&lock);
-  store = std::make_unique<ClawdbTableStore>();
-  hnsw = std::make_unique<ClawdbHnswIndex>(
-      CLAWDB_HNSW_DEFAULT_M, CLAWDB_HNSW_DEFAULT_EF_CONSTRUCTION,
-      CLAWDB_HNSW_DEFAULT_EF_SEARCH, ClawdbDistanceMetric::L2);
-}
-
-ClawdbShare::~ClawdbShare() { thr_lock_delete(&lock); }
 
 /* -----------------------------------------------------------------------
    ha_clawdb constructor
@@ -148,24 +135,6 @@ ha_clawdb::ha_clawdb(handlerton *hton, TABLE_SHARE *table_arg)
      critical on MySQL 5.7 where filesort with BLOB columns calls
      position() before info(HA_STATUS_CONST). */
   ref_length = sizeof(ClawdbRowPosition);
-}
-
-/* -----------------------------------------------------------------------
-   Share management
-   ----------------------------------------------------------------------- */
-
-ClawdbShare *ha_clawdb::get_share(const char *table_name) {
-  std::string key(table_name);
-  std::unique_lock<std::mutex> lock(global_share_mutex);
-
-  auto it = global_share_map.find(key);
-  if (it != global_share_map.end()) {
-    return it->second;
-  }
-
-  auto *new_share = new ClawdbShare(key);
-  global_share_map[key] = new_share;
-  return new_share;
 }
 
 /* -----------------------------------------------------------------------
@@ -192,19 +161,24 @@ int ha_clawdb::rebuild_hnsw_index() {
 
   share_->hnsw->clear();
 
-  int vector_field_idx = find_vector_field_index();
+  int vector_field_idx = clawdb_find_vector_field_index(table);
   if (vector_field_idx < 0) {
     /* No BLOB field found; nothing to index. */
     return 0;
   }
 
   ClawdbRowPosition position = share_->store->scan_start_position();
+  size_t rows_scanned = 0;
+  size_t rows_indexed = 0;
+  size_t rows_failed = 0;
 
   while (true) {
     ClawdbRowPosition live_position = CLAWDB_INVALID_POSITION;
     int rc = share_->store->next_live_row(position, &live_position);
     if (rc == HA_ERR_END_OF_FILE) break;
     if (rc != 0) return rc;
+
+    ++rows_scanned;
 
     std::vector<unsigned char> row_data;
     uint32_t row_length = 0;
@@ -217,238 +191,40 @@ int ha_clawdb::rebuild_hnsw_index() {
     /* Deserialize the stored row into a temporary record buffer so that
        Field objects can correctly decode BLOB columns. */
     std::vector<uchar> tmp_record(table->s->reclength, 0);
-    if (!deserialize_row(row_data.data(), row_data.size(), tmp_record.data())) {
+    if (!clawdb_deserialize_row(table, row_data.data(), row_data.size(), tmp_record.data())) {
+      ++rows_failed;
       position = live_position + sizeof(ClawdbRowHeader) + row_length;
       continue;
     }
 
-    /* Temporarily redirect table->record[0] so that extract_vector_from_row
-       can use move_field_offset(0) and still read from tmp_record. */
-    uchar *saved_record = table->record[0];
-    table->record[0] = tmp_record.data();
-
+    /* extract_vector_from_row uses move_field_offset(buf - record[0]) to
+       temporarily point the Field at the given buffer.  Since tmp_record
+       is NOT table->record[0], the offset will be non-zero and the Field
+       will correctly read from tmp_record without needing to swap
+       table->record[0]. */
     ClawdbVector vec;
     std::string errmsg;
-    bool ok = extract_vector_from_row(tmp_record.data(), vector_field_idx,
-                                      &vec, &errmsg);
+    bool ok = clawdb_extract_vector_from_row(table, tmp_record.data(),
+                                             vector_field_idx, &vec, &errmsg);
 
-    table->record[0] = saved_record;
-    free_blob_buffers(tmp_record.data());
+    clawdb_free_blob_buffers(table, tmp_record.data());
 
     if (ok) {
       share_->hnsw->insert(live_position, vec);
+      ++rows_indexed;
+    } else {
+      ++rows_failed;
     }
 
     position = live_position + sizeof(ClawdbRowHeader) + row_length;
   }
 
+  DBUG_PRINT("info", ("ClawDB: HNSW rebuild: scanned=%zu, indexed=%zu, "
+                        "failed=%zu, hnsw_size=%zu",
+                        rows_scanned, rows_indexed, rows_failed,
+                        share_->hnsw->size()));
+
   return 0;
-}
-
-/* -----------------------------------------------------------------------
-   Vector field helpers
-   ----------------------------------------------------------------------- */
-
-int ha_clawdb::find_vector_field_index() const {
-  if (table == nullptr) return -1;
-
-  for (uint i = 0; i < table->s->fields; ++i) {
-    if (is_blob_field(table->field[i])) {
-      return static_cast<int>(i);
-    }
-  }
-  return -1;
-}
-
-bool ha_clawdb::extract_vector_from_row(const uchar *buf, int field_idx,
-                                        ClawdbVector *vec,
-                                        std::string *errmsg) const {
-  Field *field = table->field[field_idx];
-
-  /* Point the field at the given row buffer using move_field_offset().
-     The offset is the difference between the target buffer and record[0]. */
-  const ptrdiff_t row_offset =
-      static_cast<ptrdiff_t>(buf - table->record[0]);
-  field->move_field_offset(row_offset);
-
-  if (field->is_null()) {
-    field->move_field_offset(-row_offset);
-    if (errmsg) *errmsg = "vector field is NULL";
-    return false;
-  }
-
-  /* Read the BLOB data. */
-  Field_blob *blob_field = down_cast<Field_blob *>(field);
-  uint32_t blob_length = blob_field->get_length();
-  const uchar *blob_data = clawdb_get_blob_data(blob_field);
-
-  field->move_field_offset(-row_offset);
-
-  if (blob_data == nullptr || blob_length == 0) {
-    if (errmsg) *errmsg = "empty vector blob";
-    return false;
-  }
-
-  return clawdb_deserialize_vector(blob_data, blob_length, vec, errmsg);
-}
-
-/* -----------------------------------------------------------------------
-   Row serialization / deserialization
-   ----------------------------------------------------------------------- */
-
-/**
-  Serialize a MySQL record buffer into a portable byte stream.
-
-  Format:
-    [null_bitmap: table->s->null_bytes bytes]
-    For each non-BLOB field:
-      [field data: field->pack_length() bytes]
-    For each BLOB field:
-      [uint32_t blob_len][blob_len bytes of actual blob data]
-
-  This avoids storing raw in-memory pointers (which BLOB fields contain
-  in the standard MySQL record format) and makes the data file portable
-  across process restarts.
-*/
-void ha_clawdb::serialize_row(const uchar *buf,
-                              std::vector<unsigned char> *out) const {
-  out->clear();
-
-  /* Null bitmap. */
-  const uint null_bytes = table->s->null_bytes;
-  out->insert(out->end(), buf, buf + null_bytes);
-
-  for (uint field_idx = 0; field_idx < table->s->fields; ++field_idx) {
-    Field *field = table->field[field_idx];
-
-    /* Point the field at the source buffer. */
-    const ptrdiff_t offset = static_cast<ptrdiff_t>(buf - table->record[0]);
-    field->move_field_offset(offset);
-
-    if (is_blob_field(field)) {
-      Field_blob *blob_field = down_cast<Field_blob *>(field);
-      uint32_t blob_len = blob_field->get_length();
-      const uchar *blob_data = clawdb_get_blob_data(blob_field);
-
-      /* Store 4-byte little-endian length followed by raw blob bytes. */
-      unsigned char len_buf[4];
-      std::memcpy(len_buf, &blob_len, sizeof(uint32_t));
-      out->insert(out->end(), len_buf, len_buf + 4);
-
-      if (blob_len > 0 && blob_data != nullptr) {
-        out->insert(out->end(), blob_data, blob_data + blob_len);
-      }
-    } else {
-      /* Non-BLOB: copy the field's in-record bytes verbatim. */
-      const uchar *fld_ptr = clawdb_field_ptr(field);
-      uint32_t field_len = field->pack_length();
-      out->insert(out->end(), fld_ptr, fld_ptr + field_len);
-    }
-
-    field->move_field_offset(-offset);
-  }
-}
-
-/**
-  Deserialize a portable byte stream back into a MySQL record buffer.
-
-  Reconstructs BLOB fields by allocating heap memory for each BLOB's
-  data and storing the pointer in the correct location within buf.
-  The caller must call free_blob_buffers(buf) when done with the row.
-*/
-bool ha_clawdb::deserialize_row(const unsigned char *data, size_t len,
-                                uchar *buf) const {
-  const unsigned char *ptr = data;
-  const unsigned char *end = data + len;
-
-  /* Restore null bitmap. */
-  const uint null_bytes = table->s->null_bytes;
-  if (ptr + null_bytes > end) return false;
-  std::memcpy(buf, ptr, null_bytes);
-  ptr += null_bytes;
-
-  for (uint field_idx = 0; field_idx < table->s->fields; ++field_idx) {
-    Field *field = table->field[field_idx];
-
-    /* Point the field at the destination buffer. */
-    const ptrdiff_t offset = static_cast<ptrdiff_t>(buf - table->record[0]);
-    field->move_field_offset(offset);
-
-    if (is_blob_field(field)) {
-      Field_blob *blob_field = down_cast<Field_blob *>(field);
-
-      /* Read 4-byte little-endian length. */
-      if (ptr + 4 > end) {
-        field->move_field_offset(-offset);
-        return false;
-      }
-      uint32_t blob_len = 0;
-      std::memcpy(&blob_len, ptr, sizeof(uint32_t));
-      ptr += 4;
-
-      if (ptr + blob_len > end) {
-        field->move_field_offset(-offset);
-        return false;
-      }
-
-      if (blob_len == 0) {
-        /* NULL or empty blob: mark null and store zero-length pointer. */
-        blob_field->set_null();
-        blob_field->set_ptr(static_cast<uint32_t>(0),
-                            static_cast<const uchar *>(nullptr));
-      } else {
-        /* Allocate heap memory and copy blob data. */
-        uchar *heap_buf = new (std::nothrow) uchar[blob_len];
-        if (heap_buf == nullptr) {
-          field->move_field_offset(-offset);
-          return false;
-        }
-        std::memcpy(heap_buf, ptr, blob_len);
-        blob_field->set_notnull();
-        blob_field->set_ptr(blob_len, heap_buf);
-        ptr += blob_len;
-      }
-    } else {
-      /* Non-BLOB: copy bytes directly into the record buffer. */
-      uint32_t field_len = field->pack_length();
-      if (ptr + field_len > end) {
-        field->move_field_offset(-offset);
-        return false;
-      }
-      uchar *fld_ptr = clawdb_field_ptr(field);
-      std::memcpy(fld_ptr, ptr, field_len);
-      ptr += field_len;
-    }
-
-    field->move_field_offset(-offset);
-  }
-
-  return true;
-}
-
-/**
-  Free BLOB buffers allocated by deserialize_row().
-*/
-void ha_clawdb::free_blob_buffers(uchar *buf) const {
-  for (uint field_idx = 0; field_idx < table->s->fields; ++field_idx) {
-    Field *field = table->field[field_idx];
-
-    if (!is_blob_field(field)) continue;
-
-    const ptrdiff_t offset = static_cast<ptrdiff_t>(buf - table->record[0]);
-    field->move_field_offset(offset);
-
-    Field_blob *blob_field = down_cast<Field_blob *>(field);
-    uchar *blob_ptr = const_cast<uchar *>(clawdb_get_blob_data(blob_field));
-    if (blob_ptr != nullptr) {
-      delete[] blob_ptr;
-      /* Zero out the pointer in the record buffer to avoid double-free. */
-      blob_field->set_ptr(static_cast<uint32_t>(0),
-                          static_cast<const uchar *>(nullptr));
-    }
-
-    field->move_field_offset(-offset);
-  }
 }
 
 /* -----------------------------------------------------------------------
@@ -458,12 +234,33 @@ void ha_clawdb::free_blob_buffers(uchar *buf) const {
 int ha_clawdb::open(CLAWDB_OPEN_ARGS) {
   DBUG_TRACE;
 
-  share_ = get_share(name);
+  share_ = clawdb_get_share(name);
   if (share_ == nullptr) return HA_ERR_OUT_OF_MEM;
 
   thr_lock_data_init(&share_->lock, &lock_, nullptr);
 
+  /* Parse HNSW parameters from index COMMENT (if any).
+     This must happen before rebuild_hnsw_index() so that the index
+     is constructed with the correct parameters. */
+  apply_hnsw_index_params();
+
   std::unique_lock<std::mutex> lock(share_->share_mutex);
+
+  /* Compute the .hnsw file path (parallel to the .clawdb data file). */
+  if (share_->hnsw_file_path.empty()) {
+    std::string data_path = make_data_file_path(name);
+    /* Replace .clawdb extension with .hnsw */
+    std::string hnsw_path = data_path;
+    size_t ext_pos = hnsw_path.rfind(".clawdb");
+    if (ext_pos != std::string::npos) {
+      hnsw_path.replace(ext_pos, 7, ".hnsw");
+    } else {
+      hnsw_path += ".hnsw";
+    }
+    share_->hnsw_file_path = hnsw_path;
+  }
+
+  ++share_->open_count;
 
   if (!share_->store->is_open()) {
     std::string file_path = make_data_file_path(name);
@@ -475,9 +272,49 @@ int ha_clawdb::open(CLAWDB_OPEN_ARGS) {
       return 0;
     }
 
+    /* Try to load the persisted HNSW index from the .hnsw file.
+       If successful, skip the expensive rebuild from the data file. */
+    if (share_->hnsw_params.has_vector_index && share_->hnsw) {
+      bool loaded = share_->hnsw->load(share_->hnsw_file_path);
+      if (loaded && share_->hnsw->size() > 0) {
+        share_->hnsw_dirty = false;
+        return 0;
+      }
+    }
+
     lock.unlock();
     rc = rebuild_hnsw_index();
     if (rc != 0) return rc;
+
+    /* After a successful rebuild, persist the index immediately so that
+       subsequent restarts can load it directly. */
+    if (share_->hnsw_params.has_vector_index && share_->hnsw &&
+        share_->hnsw->size() > 0) {
+      share_->hnsw->save(share_->hnsw_file_path);
+      share_->hnsw_dirty = false;
+    }
+  } else if (share_->hnsw_params.has_vector_index &&
+             share_->hnsw && share_->hnsw->size() == 0 &&
+             share_->store->row_count() > 0) {
+    /* The store was already opened (e.g. by a DD check during startup)
+       but the HNSW index is empty — the earlier open() likely had an
+       incomplete TABLE object.  Try loading from file first, then
+       re-attempt the rebuild. */
+    bool loaded = share_->hnsw->load(share_->hnsw_file_path);
+    if (loaded && share_->hnsw->size() > 0) {
+      share_->hnsw_dirty = false;
+      return 0;
+    }
+
+    lock.unlock();
+    int rc = rebuild_hnsw_index();
+    if (rc != 0) return rc;
+
+    if (share_->hnsw_params.has_vector_index && share_->hnsw &&
+        share_->hnsw->size() > 0) {
+      share_->hnsw->save(share_->hnsw_file_path);
+      share_->hnsw_dirty = false;
+    }
   }
 
   return 0;
@@ -485,9 +322,21 @@ int ha_clawdb::open(CLAWDB_OPEN_ARGS) {
 
 int ha_clawdb::close() {
   DBUG_TRACE;
-  /* The share (and its store/hnsw) lives until the plugin is unloaded.
-     We do not close the file here because other handler instances may
-     still be using the share. */
+
+  if (share_ != nullptr) {
+    std::unique_lock<std::mutex> lock(share_->share_mutex);
+    --share_->open_count;
+
+    /* When the last handler closes, persist the HNSW index if dirty. */
+    if (share_->open_count <= 0 && share_->hnsw_dirty &&
+        share_->hnsw_params.has_vector_index && share_->hnsw &&
+        share_->hnsw->size() > 0 && !share_->hnsw_file_path.empty()) {
+      lock.unlock();
+      share_->hnsw->save(share_->hnsw_file_path);
+      share_->hnsw_dirty = false;
+    }
+  }
+
   share_ = nullptr;
   return 0;
 }
@@ -498,8 +347,13 @@ int ha_clawdb::create(CLAWDB_CREATE_ARGS) {
   std::string file_path = make_data_file_path(name);
 
   /* Get or create the share. */
-  ClawdbShare *new_share = get_share(name);
+  ClawdbShare *new_share = clawdb_get_share(name);
   if (new_share == nullptr) return HA_ERR_OUT_OF_MEM;
+
+  /* Parse HNSW parameters from index COMMENT before opening the store.
+     share_ must be set for apply_hnsw_index_params() to work. */
+  share_ = new_share;
+  apply_hnsw_index_params();
 
   std::unique_lock<std::mutex> lock(new_share->share_mutex);
 
@@ -519,6 +373,15 @@ int ha_clawdb::delete_table(CLAWDB_DELETE_TABLE_ARGS) {
 
   std::string file_path = make_data_file_path(name);
 
+  /* Compute the .hnsw file path. */
+  std::string hnsw_path = file_path;
+  size_t ext_pos = hnsw_path.rfind(".clawdb");
+  if (ext_pos != std::string::npos) {
+    hnsw_path.replace(ext_pos, 7, ".hnsw");
+  } else {
+    hnsw_path += ".hnsw";
+  }
+
   /* Remove from share map. */
   {
     std::unique_lock<std::mutex> lock(global_share_mutex);
@@ -534,6 +397,9 @@ int ha_clawdb::delete_table(CLAWDB_DELETE_TABLE_ARGS) {
     return HA_ERR_CRASHED_ON_USAGE;
   }
 
+  /* Also remove the .hnsw index file. */
+  std::remove(hnsw_path.c_str());
+
   return 0;
 }
 
@@ -542,6 +408,21 @@ int ha_clawdb::rename_table(CLAWDB_RENAME_TABLE_ARGS) {
 
   std::string from_path = make_data_file_path(from);
   std::string to_path = make_data_file_path(to);
+
+  /* Compute .hnsw file paths. */
+  auto make_hnsw_path = [](const std::string &data_path) -> std::string {
+    std::string hnsw_path = data_path;
+    size_t ext_pos = hnsw_path.rfind(".clawdb");
+    if (ext_pos != std::string::npos) {
+      hnsw_path.replace(ext_pos, 7, ".hnsw");
+    } else {
+      hnsw_path += ".hnsw";
+    }
+    return hnsw_path;
+  };
+
+  std::string from_hnsw = make_hnsw_path(from_path);
+  std::string to_hnsw = make_hnsw_path(to_path);
 
   /* Close and remove the old share. */
   {
@@ -557,6 +438,9 @@ int ha_clawdb::rename_table(CLAWDB_RENAME_TABLE_ARGS) {
   if (std::rename(from_path.c_str(), to_path.c_str()) != 0) {
     return HA_ERR_CRASHED_ON_USAGE;
   }
+
+  /* Also rename the .hnsw index file (ignore errors if it doesn't exist). */
+  std::rename(from_hnsw.c_str(), to_hnsw.c_str());
 
   return 0;
 }
@@ -577,7 +461,7 @@ int ha_clawdb::write_row(uchar *buf) {
   /* Serialize the row into a portable byte stream (BLOB pointers are
      replaced with inline data so the file is valid across restarts). */
   std::vector<unsigned char> serialized;
-  serialize_row(buf, &serialized);
+  clawdb_serialize_row(table, buf, &serialized);
 
   /* Append the serialized row and capture its file position. */
   ClawdbRowPosition new_position = CLAWDB_INVALID_POSITION;
@@ -589,11 +473,12 @@ int ha_clawdb::write_row(uchar *buf) {
   /* Update the HNSW index with the new vector.
      We unlock before calling into the HNSW index because HNSW operations
      can be expensive and the index has its own internal locking. */
-  int vector_field_idx = find_vector_field_index();
+  int vector_field_idx = clawdb_find_vector_field_index(table);
   if (vector_field_idx >= 0) {
     ClawdbVector vec;
     std::string errmsg;
-    if (extract_vector_from_row(buf, vector_field_idx, &vec, &errmsg)) {
+    if (clawdb_extract_vector_from_row(table, buf, vector_field_idx, &vec, &errmsg)) {
+      share_->hnsw_dirty = true;
       lock.unlock();
       share_->hnsw->insert(new_position, vec);
     }
@@ -602,7 +487,7 @@ int ha_clawdb::write_row(uchar *buf) {
   return 0;
 }
 
-int ha_clawdb::update_row(const uchar *old_data [[maybe_unused]],
+int ha_clawdb::update_row(const uchar * /*old_data*/,
                           uchar *new_data) {
   DBUG_TRACE;
 
@@ -614,7 +499,7 @@ int ha_clawdb::update_row(const uchar *old_data [[maybe_unused]],
 
   /* Serialize the new row into a portable byte stream. */
   std::vector<unsigned char> serialized;
-  serialize_row(new_data, &serialized);
+  clawdb_serialize_row(table, new_data, &serialized);
 
   ClawdbRowPosition new_position = CLAWDB_INVALID_POSITION;
   int rc = share_->store->update_row_at(current_position_, serialized.data(),
@@ -623,14 +508,15 @@ int ha_clawdb::update_row(const uchar *old_data [[maybe_unused]],
   if (rc != 0) return HA_ERR_CRASHED_ON_USAGE;
 
   /* Update HNSW index: remove old entry, insert new one. */
-  int vector_field_idx = find_vector_field_index();
+  int vector_field_idx = clawdb_find_vector_field_index(table);
   if (vector_field_idx >= 0) {
     share_->hnsw->remove(current_position_);
 
     ClawdbVector new_vec;
     std::string errmsg;
-    if (extract_vector_from_row(new_data, vector_field_idx, &new_vec,
-                                &errmsg)) {
+    if (clawdb_extract_vector_from_row(table, new_data, vector_field_idx,
+                                       &new_vec, &errmsg)) {
+      share_->hnsw_dirty = true;
       lock.unlock();
       share_->hnsw->insert(new_position, new_vec);
     }
@@ -653,6 +539,7 @@ int ha_clawdb::delete_row(const uchar * /*buf*/) {
   if (rc != 0) return HA_ERR_CRASHED_ON_USAGE;
 
   /* Remove from HNSW index. */
+  share_->hnsw_dirty = true;
   lock.unlock();
   share_->hnsw->remove(current_position_);
 
@@ -671,12 +558,30 @@ int ha_clawdb::rnd_init(bool /*scan*/) {
 
   scan_position_ = share_->store->scan_start_position();
   current_position_ = CLAWDB_INVALID_POSITION;
+
+  /* Reset HNSW scan state from any previous scan. */
+  hnsw_scan_active_ = false;
+  hnsw_scan_results_.clear();
+  hnsw_scan_index_ = 0;
+
+  /* Mark that we have not yet attempted HNSW probe.  The actual HNSW
+     search is deferred to the first rnd_next() call because MySQL may
+     call rnd_init() before vector_distance_init() has set the
+     thread-local query hint. */
+  hnsw_probe_attempted_ = false;
+
   return 0;
 }
 
 int ha_clawdb::rnd_end() {
   DBUG_TRACE;
   scan_position_ = CLAWDB_INVALID_POSITION;
+
+  /* Clean up HNSW scan state. */
+  hnsw_scan_active_ = false;
+  hnsw_scan_results_.clear();
+  hnsw_scan_index_ = 0;
+
   return 0;
 }
 
@@ -688,6 +593,83 @@ int ha_clawdb::rnd_next(uchar *buf) {
 
   ha_statistic_increment(&CLAWDB_STAT(ha_read_rnd_next_count));
 
+  /* ---- Deferred HNSW probe ----
+     MySQL calls vector_distance_init() lazily — only when the first row
+     is being evaluated, which is AFTER the first rnd_next() has already
+     returned a row.  Therefore we check the thread-local hint on EVERY
+     rnd_next() call until either:
+       (a) we successfully activate HNSW mode, or
+       (b) we have already probed and the hint was not set.
+     Once HNSW mode is activated mid-scan, we discard the rows already
+     returned by the full-table scan path and switch to returning only
+     HNSW candidates.  MySQL's filesort will re-sort everything anyway,
+     so returning a superset (some full-scan rows + all HNSW candidates)
+     is correct — the extra rows just get a higher distance and are
+     filtered out by LIMIT. */
+
+  if (!hnsw_scan_active_ && !hnsw_probe_attempted_ &&
+      share_->hnsw_params.has_vector_index &&
+      share_->hnsw && share_->hnsw->size() > 0) {
+    ClawdbHnswQueryHint &hint = clawdb_get_thread_query_hint();
+    if (hint.active && hint.query_vec.dim > 0) {
+      hnsw_probe_attempted_ = true;
+
+      int candidate_count = share_->hnsw_params.ef_search;
+      if (candidate_count < 10) candidate_count = 10;
+
+      HnswSearchResult results =
+          share_->hnsw->search(hint.query_vec, candidate_count);
+
+      if (!results.empty()) {
+        hnsw_scan_results_ = std::move(results);
+        hnsw_scan_index_ = 0;
+        hnsw_scan_active_ = true;
+
+        DBUG_PRINT("info", ("ClawDB: HNSW index used: %zu candidates "
+                            "(ef_search=%d, index_size=%zu)",
+                            hnsw_scan_results_.size(), candidate_count,
+                            share_->hnsw->size()));
+      }
+
+      clawdb_clear_thread_query_hint();
+    }
+  }
+
+  /* ---- HNSW-accelerated path ----
+     When hnsw_scan_active_ is true, we iterate over the pre-computed
+     candidate list instead of scanning the entire data file.  Each
+     candidate's node_id is the row's file position (ClawdbRowPosition). */
+  if (hnsw_scan_active_) {
+    while (hnsw_scan_index_ < hnsw_scan_results_.size()) {
+      ClawdbRowPosition candidate_position =
+          static_cast<ClawdbRowPosition>(
+              hnsw_scan_results_[hnsw_scan_index_].node_id);
+      hnsw_scan_index_++;
+
+      std::vector<unsigned char> row_data;
+      uint32_t row_length = 0;
+      int rc = share_->store->read_row_at(candidate_position,
+                                          &row_data, &row_length);
+      if (rc != 0) {
+        /* Row may have been deleted since the HNSW index was built;
+           skip to the next candidate. */
+        continue;
+      }
+
+      std::memset(buf, 0, table->s->reclength);
+      if (!clawdb_deserialize_row(table, row_data.data(), row_data.size(), buf)) {
+        continue;
+      }
+
+      current_position_ = candidate_position;
+      return 0;
+    }
+
+    /* All HNSW candidates exhausted. */
+    return HA_ERR_END_OF_FILE;
+  }
+
+  /* ---- Original full-table scan path ---- */
   ClawdbRowPosition live_position = CLAWDB_INVALID_POSITION;
   int rc = share_->store->next_live_row(scan_position_, &live_position);
   if (rc == HA_ERR_END_OF_FILE) return HA_ERR_END_OF_FILE;
@@ -701,7 +683,7 @@ int ha_clawdb::rnd_next(uchar *buf) {
   /* Deserialize the portable byte stream back into the MySQL record buffer.
      This correctly reconstructs BLOB fields with valid heap pointers. */
   std::memset(buf, 0, table->s->reclength);
-  if (!deserialize_row(row_data.data(), row_data.size(), buf)) {
+  if (!clawdb_deserialize_row(table, row_data.data(), row_data.size(), buf)) {
     return HA_ERR_CRASHED_ON_USAGE;
   }
 
@@ -737,7 +719,7 @@ int ha_clawdb::rnd_pos(uchar *buf, uchar *pos) {
 
   /* Deserialize the portable byte stream back into the MySQL record buffer. */
   std::memset(buf, 0, table->s->reclength);
-  if (!deserialize_row(row_data.data(), row_data.size(), buf)) {
+  if (!clawdb_deserialize_row(table, row_data.data(), row_data.size(), buf)) {
     return HA_ERR_CRASHED_ON_USAGE;
   }
 
@@ -785,7 +767,7 @@ int ha_clawdb::scan_and_match_key(uchar *buf) {
     if (rc != 0) continue;
 
     std::memset(buf, 0, table->s->reclength);
-    if (!deserialize_row(row_data.data(), row_data.size(), buf)) continue;
+    if (!clawdb_deserialize_row(table, row_data.data(), row_data.size(), buf)) continue;
 
     /* Compare each key part against the saved lookup key. */
     key_part_map remaining_map = index_key_part_map_;
@@ -818,7 +800,7 @@ int ha_clawdb::scan_and_match_key(uchar *buf) {
       return 0;
     }
 
-    free_blob_buffers(buf);
+    clawdb_free_blob_buffers(table, buf);
   }
 }
 
@@ -910,6 +892,12 @@ int ha_clawdb::delete_all_rows() {
   std::unique_lock<std::mutex> lock(share_->share_mutex);
   int rc = share_->store->truncate();
   if (rc != 0) return HA_ERR_CRASHED_ON_USAGE;
+
+  /* Remove the persisted .hnsw file since the index is now empty. */
+  if (!share_->hnsw_file_path.empty()) {
+    std::remove(share_->hnsw_file_path.c_str());
+  }
+  share_->hnsw_dirty = false;
 
   return 0;
 }
@@ -1019,10 +1007,9 @@ static int clawdb_init(void *plugin_handle) {
     /* UDF registration failed; log but do not abort plugin load.
        The engine itself is still functional; UDFs can be registered
        manually via CREATE FUNCTION if needed. */
-    fprintf(stderr,
-            "[ClawDB] WARNING: failed to register UDFs "
-            "(vector_distance, clawdb_to_vector, clawdb_from_vector). "
-            "The storage engine is still available.\n");
+    DBUG_PRINT("warning", ("ClawDB: failed to register UDFs "
+                          "(vector_distance, clawdb_to_vector, "
+                          "clawdb_from_vector). Engine still available"));
   }
 
   return 0;
@@ -1036,14 +1023,7 @@ static int clawdb_deinit(void * /*plugin_handle*/) {
   clawdb_manage_udfs(false);
 
   /* Close and free all open shares. */
-  {
-    std::unique_lock<std::mutex> lock(global_share_mutex);
-    for (auto &kv : global_share_map) {
-      kv.second->store->close();
-      delete kv.second;
-    }
-    global_share_map.clear();
-  }
+  clawdb_close_all_shares();
 
   return 0;
 }

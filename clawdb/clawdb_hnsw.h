@@ -43,6 +43,7 @@
 #define STORAGE_CLAWDB_CLAWDB_HNSW_H
 
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -184,6 +185,38 @@ class ClawdbHnswIndex {
 
   /** Return the distance metric used by this index. */
   ClawdbDistanceMetric metric() const { return metric_; }
+
+  /* ---- Persistence ---- */
+
+  /**
+    Save the entire HNSW graph to a binary file.
+
+    File format (all multi-byte integers in native byte order):
+      [HnswFileHeader 40 bytes]
+      For each node:
+        [uint64_t node_id]
+        [int32_t  level]
+        [uint32_t vector_dim]
+        [float × dim]              (vector data)
+        For each layer 0..level:
+          [uint32_t neighbor_count]
+          [uint64_t × neighbor_count]  (neighbor node_ids)
+
+    @param[in] file_path  Path to the output .hnsw file.
+    @return true on success, false on I/O error.
+  */
+  bool save(const std::string &file_path) const;
+
+  /**
+    Load the HNSW graph from a binary file previously written by save().
+
+    Replaces all current in-memory state.  The index parameters (m,
+    ef_construction, ef_search, metric) are restored from the file header.
+
+    @param[in] file_path  Path to the .hnsw file.
+    @return true on success, false on I/O error or format mismatch.
+  */
+  bool load(const std::string &file_path);
 
  private:
   /* ---- Algorithm helpers (Algorithm 1-5 from the HNSW paper) ---- */

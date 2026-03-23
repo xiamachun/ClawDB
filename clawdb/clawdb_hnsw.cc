@@ -29,6 +29,10 @@
 */
 
 #include "clawdb_hnsw.h"
+#include "clawdb_vec.h"
+#include "my_dbug.h"
+
+#include <memory>
 
 #include <algorithm>
 #include <cassert>
@@ -433,4 +437,235 @@ void ClawdbHnswIndex::clear() {
   nodes_.clear();
   entry_point_ = CLAWDB_HNSW_INVALID_NODE;
   max_level_ = -1;
+}
+
+/* -----------------------------------------------------------------------
+   Persistence: save / load
+   ----------------------------------------------------------------------- */
+
+/** RAII wrapper for FILE* to ensure proper cleanup. */
+struct FileGuard {
+  FILE *fp;
+  bool dismiss{false};
+  explicit FileGuard(FILE *f) : fp(f) {}
+  ~FileGuard() { if (fp && !dismiss) std::fclose(fp); }
+};
+
+/** Magic number for the .hnsw index file. */
+static constexpr uint32_t CLAWDB_HNSW_FILE_MAGIC = 0xC1ADB002;
+
+/** File format version for the .hnsw index file. */
+static constexpr uint16_t CLAWDB_HNSW_FILE_VERSION = 1;
+
+#pragma pack(push, 1)
+struct HnswFileHeader {
+  uint32_t magic;            /* 0xC1ADB002 */
+  uint16_t version;          /* 1 */
+  uint16_t m;                /* M parameter */
+  uint16_t ef_construction;  /* ef_construction parameter */
+  uint16_t ef_search;        /* ef_search parameter */
+  uint8_t  metric;           /* 0=L2, 1=COSINE */
+  uint8_t  reserved;         /* padding */
+  uint64_t entry_point;      /* entry point node_id */
+  int32_t  max_level;        /* maximum layer in the graph */
+  uint32_t node_count;       /* number of nodes */
+  uint32_t vector_dim;       /* vector dimension (0 if empty) */
+};
+#pragma pack(pop)
+
+static_assert(sizeof(HnswFileHeader) == 34, "HnswFileHeader size mismatch");
+
+bool ClawdbHnswIndex::save(const std::string &file_path) const {
+  std::unique_lock<std::mutex> lock(index_mutex_);
+
+  FILE *fp = std::fopen(file_path.c_str(), "wb");
+  if (fp == nullptr) return false;
+  FileGuard guard(fp);
+
+  /* Determine vector dimension from the first node (0 if empty). */
+  uint32_t dim = 0;
+  if (!nodes_.empty()) {
+    dim = nodes_.begin()->second->vector.dim;
+  }
+
+  /* Write header. */
+  HnswFileHeader header;
+  header.magic = CLAWDB_HNSW_FILE_MAGIC;
+  header.version = CLAWDB_HNSW_FILE_VERSION;
+  header.m = static_cast<uint16_t>(m_);
+  header.ef_construction = static_cast<uint16_t>(ef_construction_);
+  header.ef_search = static_cast<uint16_t>(ef_search_);
+  header.metric = (metric_ == ClawdbDistanceMetric::COSINE) ? 1 : 0;
+  header.reserved = 0;
+  header.entry_point = entry_point_;
+  header.max_level = max_level_;
+  header.node_count = static_cast<uint32_t>(nodes_.size());
+  header.vector_dim = dim;
+
+  if (std::fwrite(&header, sizeof(header), 1, fp) != 1) {
+    std::remove(file_path.c_str());
+    return false;
+  }
+
+  /* Write each node. */
+  for (const auto &kv : nodes_) {
+    const ClawdbHnswNode *node = kv.second.get();
+
+    /* node_id (8 bytes) */
+    uint64_t node_id = node->node_id;
+    if (std::fwrite(&node_id, sizeof(node_id), 1, fp) != 1) {
+      std::remove(file_path.c_str());
+      return false;
+    }
+
+    /* level (4 bytes) */
+    int32_t level = node->level;
+    if (std::fwrite(&level, sizeof(level), 1, fp) != 1) {
+      std::remove(file_path.c_str());
+      return false;
+    }
+
+    /* vector_dim (4 bytes) + float data */
+    uint32_t node_dim = node->vector.dim;
+    if (std::fwrite(&node_dim, sizeof(node_dim), 1, fp) != 1) {
+      std::remove(file_path.c_str());
+      return false;
+    }
+
+    if (node_dim > 0) {
+      if (std::fwrite(node->vector.values.data(), sizeof(float), node_dim, fp)
+          != node_dim) {
+        std::remove(file_path.c_str());
+        return false;
+      }
+    }
+
+    /* Per-layer neighbor lists. */
+    for (int lc = 0; lc <= node->level; ++lc) {
+      uint32_t neighbor_count =
+          static_cast<uint32_t>(node->neighbors[lc].size());
+      if (std::fwrite(&neighbor_count, sizeof(neighbor_count), 1, fp) != 1) {
+        std::remove(file_path.c_str());
+        return false;
+      }
+
+      if (neighbor_count > 0) {
+        if (std::fwrite(node->neighbors[lc].data(),
+                        sizeof(HnswNodeId), neighbor_count, fp)
+            != neighbor_count) {
+          std::remove(file_path.c_str());
+          return false;
+        }
+      }
+    }
+  }
+
+  guard.dismiss = true;
+  std::fflush(fp);
+  std::fclose(fp);
+
+  DBUG_PRINT("info", ("ClawDB: HNSW index saved: %zu nodes, dim=%u", nodes_.size(), dim));
+  return true;
+}
+
+bool ClawdbHnswIndex::load(const std::string &file_path) {
+  std::unique_lock<std::mutex> lock(index_mutex_);
+
+  FILE *fp = std::fopen(file_path.c_str(), "rb");
+  if (fp == nullptr) return false;
+  FileGuard guard(fp);
+
+  /* Read and validate header. */
+  HnswFileHeader header;
+  if (std::fread(&header, sizeof(header), 1, fp) != 1) {
+    return false;
+  }
+
+  if (header.magic != CLAWDB_HNSW_FILE_MAGIC ||
+      header.version != CLAWDB_HNSW_FILE_VERSION) {
+    return false;
+  }
+
+  /* Restore index parameters from the file header. */
+  m_ = header.m;
+  m0_ = 2 * m_;
+  ef_construction_ = header.ef_construction;
+  ef_search_ = header.ef_search;
+  metric_ = (header.metric == 1) ? ClawdbDistanceMetric::COSINE
+                                 : ClawdbDistanceMetric::L2;
+  entry_point_ = header.entry_point;
+  max_level_ = header.max_level;
+
+  /* Clear existing nodes and load from file. */
+  nodes_.clear();
+
+  for (uint32_t i = 0; i < header.node_count; ++i) {
+    uint64_t node_id;
+    if (std::fread(&node_id, sizeof(node_id), 1, fp) != 1) {
+      nodes_.clear();
+      entry_point_ = CLAWDB_HNSW_INVALID_NODE;
+      max_level_ = -1;
+      return false;
+    }
+
+    int32_t level;
+    if (std::fread(&level, sizeof(level), 1, fp) != 1) {
+      nodes_.clear();
+      entry_point_ = CLAWDB_HNSW_INVALID_NODE;
+      max_level_ = -1;
+      return false;
+    }
+
+    uint32_t node_dim;
+    if (std::fread(&node_dim, sizeof(node_dim), 1, fp) != 1) {
+      nodes_.clear();
+      entry_point_ = CLAWDB_HNSW_INVALID_NODE;
+      max_level_ = -1;
+      return false;
+    }
+
+    ClawdbVector vec(node_dim);
+    if (node_dim > 0) {
+      if (std::fread(vec.values.data(), sizeof(float), node_dim, fp)
+          != node_dim) {
+        nodes_.clear();
+        entry_point_ = CLAWDB_HNSW_INVALID_NODE;
+        max_level_ = -1;
+        return false;
+      }
+    }
+
+    auto node = std::make_unique<ClawdbHnswNode>(node_id, vec, level, m_);
+
+    /* Read per-layer neighbor lists. */
+    for (int lc = 0; lc <= level; ++lc) {
+      uint32_t neighbor_count;
+      if (std::fread(&neighbor_count, sizeof(neighbor_count), 1, fp) != 1) {
+        nodes_.clear();
+        entry_point_ = CLAWDB_HNSW_INVALID_NODE;
+        max_level_ = -1;
+        return false;
+      }
+
+      node->neighbors[lc].resize(neighbor_count);
+      if (neighbor_count > 0) {
+        if (std::fread(node->neighbors[lc].data(),
+                       sizeof(HnswNodeId), neighbor_count, fp)
+            != neighbor_count) {
+          nodes_.clear();
+          entry_point_ = CLAWDB_HNSW_INVALID_NODE;
+          max_level_ = -1;
+          return false;
+        }
+      }
+    }
+
+    nodes_[node_id] = std::move(node);
+  }
+
+  guard.dismiss = true;
+  std::fclose(fp);
+
+  DBUG_PRINT("info", ("ClawDB: HNSW index loaded: %zu nodes, dim=%u", nodes_.size(), header.vector_dim));
+  return true;
 }

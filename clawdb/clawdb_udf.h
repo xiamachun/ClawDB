@@ -26,7 +26,39 @@
 
 #include "clawdb_compat.h"
 
+/* -----------------------------------------------------------------------
+   Thread-local HNSW query hint.
+
+   When vector_distance() is called, it stores the parsed query vector
+   and metric in a thread-local variable.  ha_clawdb::rnd_init() checks
+   this hint and, if an HNSW index is available, performs an approximate
+   nearest-neighbor search to narrow down the rows returned by rnd_next().
+
+   This avoids modifying the MySQL optimizer and works across all
+   supported MySQL versions (5.7, 8.0, 8.4).
+   ----------------------------------------------------------------------- */
+
 #ifdef __cplusplus
+
+#include "clawdb_vec.h"
+#include <vector>
+
+/**
+  Thread-local hint set by vector_distance() for HNSW-accelerated scans.
+*/
+struct ClawdbHnswQueryHint {
+  bool active{false};                   ///< true when a query vector is set
+  ClawdbVector query_vec;               ///< The parsed query vector
+  ClawdbDistanceMetric metric{ClawdbDistanceMetric::L2};
+  int top_k{0};                         ///< Requested LIMIT (0 = unknown)
+};
+
+/** Get the thread-local HNSW query hint for the current thread. */
+ClawdbHnswQueryHint &clawdb_get_thread_query_hint();
+
+/** Clear the thread-local HNSW query hint. */
+void clawdb_clear_thread_query_hint();
+
 extern "C" {
 #endif
 

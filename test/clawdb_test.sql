@@ -177,7 +177,88 @@ WHERE id = 6;
 -- Expected: NULL
 
 -- ---------------------------------------------------------------------------
--- 10. Larger dimension test (128-dim)
+-- 10. CREATE INDEX with HNSW COMMENT (vector index)
+-- ---------------------------------------------------------------------------
+
+-- 10a. Create a table and add a vector index with HNSW parameters via COMMENT
+CREATE TABLE vec_hnsw (
+  id        INT          NOT NULL PRIMARY KEY,
+  label     VARCHAR(64)  NOT NULL,
+  embedding BLOB         NOT NULL COMMENT 'VECTOR(4)'
+) ENGINE=CLAWDB;
+
+CREATE INDEX vec_hnsw_idx ON vec_hnsw (embedding(32))
+  COMMENT 'HNSW(metric=cosine, m=32, ef_construction=200, ef_search=100)';
+
+-- Verify the index exists
+SELECT INDEX_NAME, INDEX_TYPE, INDEX_COMMENT
+FROM information_schema.STATISTICS
+WHERE TABLE_SCHEMA = 'clawdb_test' AND TABLE_NAME = 'vec_hnsw'
+  AND INDEX_NAME = 'vec_hnsw_idx'
+LIMIT 1;
+-- Expected: vec_hnsw_idx | HASH | HNSW(metric=cosine, m=32, ef_construction=200, ef_search=100)
+
+-- 10b. Insert vectors and verify cosine-distance KNN works
+INSERT INTO vec_hnsw VALUES
+  (1, 'a', clawdb_to_vector('[1.0, 0.0, 0.0, 0.0]')),
+  (2, 'b', clawdb_to_vector('[0.0, 1.0, 0.0, 0.0]')),
+  (3, 'c', clawdb_to_vector('[1.0, 1.0, 0.0, 0.0]'));
+
+SELECT id, label,
+       vector_distance(embedding, '[1.0, 0.0, 0.0, 0.0]', 'cosine') AS dist
+FROM vec_hnsw
+ORDER BY dist
+LIMIT 3;
+-- Expected:
+--   1 | a | 0       (exact match)
+--   3 | c | ~0.29   (cosine distance to [1,1,0,0])
+--   2 | b | 1       (orthogonal)
+
+-- 10c. Create a table with inline vector index (in CREATE TABLE)
+CREATE TABLE vec_inline_idx (
+  id        INT          NOT NULL PRIMARY KEY,
+  embedding BLOB         NOT NULL COMMENT 'VECTOR(4)',
+  KEY vec_idx (embedding(32)) COMMENT 'HNSW(metric=l2, m=16)'
+) ENGINE=CLAWDB;
+
+INSERT INTO vec_inline_idx VALUES
+  (1, clawdb_to_vector('[1.0, 0.0, 0.0, 0.0]')),
+  (2, clawdb_to_vector('[0.0, 1.0, 0.0, 0.0]'));
+
+SELECT id, vector_distance(embedding, '[1.0, 0.0, 0.0, 0.0]') AS dist
+FROM vec_inline_idx
+ORDER BY dist
+LIMIT 2;
+-- Expected:
+--   1 | 0  (exact match)
+--   2 | 2  (L2 squared distance)
+
+-- 10d. Create a vector index with default HNSW parameters (no COMMENT body)
+CREATE TABLE vec_default_idx (
+  id        INT          NOT NULL PRIMARY KEY,
+  embedding BLOB         NOT NULL COMMENT 'VECTOR(4)'
+) ENGINE=CLAWDB;
+
+CREATE INDEX vec_def_idx ON vec_default_idx (embedding(32));
+
+INSERT INTO vec_default_idx VALUES
+  (1, clawdb_to_vector('[1.0, 0.0, 0.0, 0.0]')),
+  (2, clawdb_to_vector('[0.0, 1.0, 0.0, 0.0]'));
+
+SELECT id, vector_distance(embedding, '[1.0, 0.0, 0.0, 0.0]') AS dist
+FROM vec_default_idx
+ORDER BY dist
+LIMIT 2;
+-- Expected:
+--   1 | 0
+--   2 | 2
+
+DROP TABLE vec_hnsw;
+DROP TABLE vec_inline_idx;
+DROP TABLE vec_default_idx;
+
+-- ---------------------------------------------------------------------------
+-- 11. Larger dimension test (128-dim)
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE vec128 (
@@ -205,7 +286,7 @@ WHERE id = 2;
 -- Expected: 0
 
 -- ---------------------------------------------------------------------------
--- 11. TRUNCATE (delete_all_rows)
+-- 12. TRUNCATE (delete_all_rows)
 -- ---------------------------------------------------------------------------
 
 TRUNCATE TABLE vec4;
@@ -214,7 +295,7 @@ SELECT COUNT(*) AS row_count FROM vec4;
 -- Expected: 0
 
 -- ---------------------------------------------------------------------------
--- 12. DROP TABLE
+-- 13. DROP TABLE
 -- ---------------------------------------------------------------------------
 
 DROP TABLE vec4;

@@ -30,6 +30,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <sys/types.h>
 
 /* MySQL error codes we need. */
 #include "my_base.h"
@@ -76,14 +77,14 @@ void ClawdbTableStore::close() {
 }
 
 int ClawdbTableStore::write_header() {
-  if (std::fseek(data_file_, 0, SEEK_SET) != 0) return errno;
+  if (fseeko(data_file_, 0, SEEK_SET) != 0) return errno;
   if (std::fwrite(&header_, sizeof(ClawdbFileHeader), 1, data_file_) != 1)
     return errno;
   return 0;
 }
 
 int ClawdbTableStore::read_header() {
-  if (std::fseek(data_file_, 0, SEEK_SET) != 0) return errno;
+  if (fseeko(data_file_, 0, SEEK_SET) != 0) return errno;
   if (std::fread(&header_, sizeof(ClawdbFileHeader), 1, data_file_) != 1) {
     return errno ? errno : EIO;
   }
@@ -94,7 +95,7 @@ int ClawdbTableStore::read_header() {
 int ClawdbTableStore::append_row(const unsigned char *row_data,
                                  uint32_t row_length) {
   /* Seek to end of file. */
-  if (std::fseek(data_file_, 0, SEEK_END) != 0) return errno;
+  if (fseeko(data_file_, 0, SEEK_END) != 0) return errno;
 
   ClawdbRowHeader row_header;
   row_header.flags = CLAWDB_ROW_ALIVE;
@@ -114,7 +115,7 @@ int ClawdbTableStore::append_row(const unsigned char *row_data,
 int ClawdbTableStore::read_row_at(ClawdbRowPosition position,
                                   std::vector<unsigned char> *row_data,
                                   uint32_t *row_length) {
-  if (std::fseek(data_file_, static_cast<long>(position), SEEK_SET) != 0)
+  if (fseeko(data_file_, static_cast<off_t>(position), SEEK_SET) != 0)
     return errno;
 
   ClawdbRowHeader row_header;
@@ -140,7 +141,7 @@ int ClawdbTableStore::read_row_at(ClawdbRowPosition position,
 }
 
 int ClawdbTableStore::delete_row_at(ClawdbRowPosition position) {
-  if (std::fseek(data_file_, static_cast<long>(position), SEEK_SET) != 0)
+  if (fseeko(data_file_, static_cast<off_t>(position), SEEK_SET) != 0)
     return errno;
 
   ClawdbRowHeader row_header;
@@ -150,7 +151,7 @@ int ClawdbTableStore::delete_row_at(ClawdbRowPosition position) {
   if (row_header.flags == CLAWDB_ROW_DELETED) return 0;  /* Already deleted. */
 
   /* Seek back to the header and overwrite the flags byte. */
-  if (std::fseek(data_file_, static_cast<long>(position), SEEK_SET) != 0)
+  if (fseeko(data_file_, static_cast<off_t>(position), SEEK_SET) != 0)
     return errno;
 
   row_header.flags = CLAWDB_ROW_DELETED;
@@ -166,7 +167,7 @@ int ClawdbTableStore::update_row_at(ClawdbRowPosition position,
                                     uint32_t new_row_length,
                                     ClawdbRowPosition *new_position) {
   /* Read the existing row header to check its size. */
-  if (std::fseek(data_file_, static_cast<long>(position), SEEK_SET) != 0)
+  if (fseeko(data_file_, static_cast<off_t>(position), SEEK_SET) != 0)
     return errno;
 
   ClawdbRowHeader old_header;
@@ -188,8 +189,8 @@ int ClawdbTableStore::update_row_at(ClawdbRowPosition position,
   int rc = delete_row_at(position);
   if (rc != 0) return rc;
 
-  if (std::fseek(data_file_, 0, SEEK_END) != 0) return errno;
-  *new_position = static_cast<ClawdbRowPosition>(std::ftell(data_file_));
+  if (fseeko(data_file_, 0, SEEK_END) != 0) return errno;
+  *new_position = static_cast<ClawdbRowPosition>(ftello(data_file_));
 
   rc = append_row(new_row_data, new_row_length);
   if (rc != 0) {
@@ -206,7 +207,7 @@ int ClawdbTableStore::next_live_row(ClawdbRowPosition from,
   ClawdbRowPosition current = from;
 
   while (true) {
-    if (std::fseek(data_file_, static_cast<long>(current), SEEK_SET) != 0)
+    if (fseeko(data_file_, static_cast<off_t>(current), SEEK_SET) != 0)
       return errno;
 
     ClawdbRowHeader row_header;
@@ -248,9 +249,9 @@ int ClawdbTableStore::append_row_at(const unsigned char *row_data,
                                     uint32_t row_length,
                                     ClawdbRowPosition *new_position) {
   /* Seek to end of file and record the position before writing. */
-  if (std::fseek(data_file_, 0, SEEK_END) != 0) return errno;
+  if (fseeko(data_file_, 0, SEEK_END) != 0) return errno;
 
-  long offset = std::ftell(data_file_);
+  off_t offset = ftello(data_file_);
   if (offset < 0) return errno;
   *new_position = static_cast<ClawdbRowPosition>(offset);
 

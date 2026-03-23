@@ -49,54 +49,16 @@
 #define STORAGE_CLAWDB_HA_CLAWDB_H
 
 #include "clawdb_compat.h"
+#include "clawdb_serde.h"
+#include "clawdb_share.h"
+#include "clawdb_udf.h"
 #include "my_base.h"
 #include "sql/handler.h"
 #include "thr_lock.h"
 
 #include <cstddef>
-#include <limits>
-#include <memory>
-#include <mutex>
 #include <string>
-#include <unordered_map>
-
-#include "clawdb_hnsw.h"
-#include "clawdb_store.h"
-#include "clawdb_vec.h"
-
-/* -----------------------------------------------------------------------
-   Version-portable field helpers
-   Defined in ha_clawdb.cc (after Field is fully declared).
-   ----------------------------------------------------------------------- */
-
-/** Return true if the given MySQL field type is a BLOB variant. */
-bool is_blob_field(const Field *field);
-
-/** Return a mutable pointer to the field's in-record storage. */
-uchar *clawdb_field_ptr(Field *field);
-
-/* -----------------------------------------------------------------------
-   ClawdbShare: shared state across all open handlers for one table
-   ----------------------------------------------------------------------- */
-
-/**
-  Shared state for a single ClawDB table.
-
-  One ClawdbShare instance exists per open table, shared among all
-  concurrent handler instances.  Protected by the THR_LOCK and by
-  share_mutex for the HNSW index and store.
-*/
-class ClawdbShare : public Handler_share {
- public:
-  THR_LOCK lock;                          ///< MySQL table-level lock
-  std::string table_name;                 ///< Fully qualified table name
-  std::unique_ptr<ClawdbTableStore> store; ///< Row storage
-  std::unique_ptr<ClawdbHnswIndex> hnsw;  ///< In-memory HNSW index
-  std::mutex share_mutex;                 ///< Protects store and hnsw
-
-  explicit ClawdbShare(const std::string &name);
-  ~ClawdbShare() override;
-};
+#include <vector>
 
 /* -----------------------------------------------------------------------
    ha_clawdb: the storage engine handler
@@ -118,27 +80,15 @@ class ha_clawdb : public handler {
 
   const char *table_type() const override { return "CLAWDB"; }
 
-#if MYSQL_VERSION_ID < 80000
-  /* MySQL 5.7 requires bas_ext() as a pure virtual override. */
-  const char **bas_ext() const override {
-    static const char *empty[] = {NullS};
-    return empty;
-  }
-#endif
-
-  enum ha_key_alg get_default_index_algorithm() const override {
-    return HA_KEY_ALG_HASH;
-  }
-
-  bool is_index_algorithm_supported(enum ha_key_alg key_alg) const override {
-    return key_alg == HA_KEY_ALG_HASH;
-  }
+  CLAWDB_BAS_EXT_OVERRIDE
+  CLAWDB_INDEX_ALGORITHM_OVERRIDES
 
   /* ---- Capability flags ---- */
 
   ulonglong table_flags() const override {
     return HA_BINLOG_STMT_CAPABLE | HA_BINLOG_ROW_CAPABLE |
-           HA_NO_TRANSACTIONS | CLAWDB_TABLE_FLAGS_EXTRA;
+           HA_NO_TRANSACTIONS | HA_CAN_INDEX_BLOBS |
+           HA_NULL_IN_KEY | CLAWDB_TABLE_FLAGS_EXTRA;
   }
 
   ulong index_flags(uint /*inx*/, uint /*part*/,
@@ -150,12 +100,14 @@ class ha_clawdb : public handler {
     return HA_MAX_REC_LENGTH;
   }
 
-  /* Allow up to 1 key so that PRIMARY KEY on integer columns is accepted.
-     ClawDB does not actually use the key for lookups; full-table scan is used
-     for all reads.  The key metadata is stored by MySQL but ignored by us. */
-  uint max_supported_keys() const override { return 1; }
+  /* Allow up to 2 keys: one PRIMARY KEY on integer columns and one
+     secondary index on the BLOB (vector) column for HNSW configuration.
+     ClawDB does not use the key for lookups; full-table scan is used
+     for all reads.  The key metadata is stored by MySQL; the HNSW
+     parameters are extracted from the index COMMENT during create/open. */
+  uint max_supported_keys() const override { return 2; }
   uint max_supported_key_parts() const override { return 1; }
-  uint max_supported_key_length() const override { return 255; }
+  uint max_supported_key_length() const override { return 3072; }
 
   double scan_time() override {
     return static_cast<double>(stats.records + stats.deleted) / 20.0 + 10.0;
@@ -209,9 +161,6 @@ class ha_clawdb : public handler {
                              enum thr_lock_type lock_type) override;
 
  private:
-  /** Get or create the ClawdbShare for this table. */
-  ClawdbShare *get_share(const char *table_name);
-
   /**
     Build the data file path for a table.
     Format: <mysql_data_dir>/<db>/<table>.clawdb
@@ -225,55 +174,11 @@ class ha_clawdb : public handler {
   int rebuild_hnsw_index();
 
   /**
-    Find the BLOB field index that holds the vector data.
-    Returns the field index, or -1 if no BLOB field is found.
+    Scan the table's key definitions for a BLOB-column index whose
+    COMMENT contains HNSW parameters, and apply them to the share.
+    Called during create() and open().
   */
-  int find_vector_field_index() const;
-
-  /**
-    Extract the vector from a MySQL row buffer.
-
-    @param[in]  buf        MySQL row buffer
-    @param[in]  field_idx  Index of the BLOB field in table->field[]
-    @param[out] vec        Parsed vector
-    @param[out] errmsg     Error message on failure
-    @return true on success.
-  */
-  bool extract_vector_from_row(const uchar *buf, int field_idx,
-                               ClawdbVector *vec, std::string *errmsg) const;
-
-  /**
-    Serialize a MySQL record buffer into a portable byte stream.
-
-    BLOB fields are stored inline (length prefix + raw bytes) rather than
-    as in-memory pointers.  All other fields are copied verbatim.
-
-    @param[in]  buf   MySQL record buffer (table->s->reclength bytes)
-    @param[out] out   Serialized bytes
-  */
-  void serialize_row(const uchar *buf, std::vector<unsigned char> *out) const;
-
-  /**
-    Deserialize a portable byte stream back into a MySQL record buffer.
-
-    Reconstructs BLOB fields: allocates heap memory for each BLOB's data
-    and stores the pointer in the correct location within buf.  The caller
-    is responsible for freeing BLOB memory via free_blob_buffers().
-
-    @param[in]  data  Serialized bytes produced by serialize_row()
-    @param[in]  len   Length of data
-    @param[out] buf   MySQL record buffer to fill (table->s->reclength bytes)
-    @return true on success, false if data is malformed.
-  */
-  bool deserialize_row(const unsigned char *data, size_t len,
-                       uchar *buf) const;
-
-  /**
-    Free any BLOB buffers that were heap-allocated by deserialize_row().
-
-    @param[in] buf  MySQL record buffer whose BLOB pointers should be freed.
-  */
-  void free_blob_buffers(uchar *buf) const;
+  void apply_hnsw_index_params();
 
   /* ---- Per-handler state ---- */
 
@@ -305,6 +210,22 @@ class ha_clawdb : public handler {
   std::vector<uchar> index_key_buf_;
   uint index_key_len_{0};
   uint index_key_part_map_{0};
+
+  /* ---- HNSW-accelerated scan state ---- */
+
+  /** true when rnd_next() should iterate over hnsw_scan_results_
+      instead of performing a full-table scan. */
+  bool hnsw_scan_active_{false};
+
+  /** true after the first rnd_next() has checked the thread-local
+      HNSW query hint.  Prevents repeated probe attempts. */
+  bool hnsw_probe_attempted_{false};
+
+  /** Cached HNSW search results (row positions ordered by distance). */
+  std::vector<HnswCandidate> hnsw_scan_results_;
+
+  /** Current index into hnsw_scan_results_ during an HNSW scan. */
+  size_t hnsw_scan_index_{0};
 };
 
 #endif  /* STORAGE_CLAWDB_HA_CLAWDB_H */

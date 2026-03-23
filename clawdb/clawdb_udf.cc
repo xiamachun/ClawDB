@@ -66,6 +66,23 @@
 
 #include "clawdb_vec.h"
 
+/* -----------------------------------------------------------------------
+   Thread-local HNSW query hint implementation
+   ----------------------------------------------------------------------- */
+
+static thread_local ClawdbHnswQueryHint tl_hnsw_query_hint;
+
+ClawdbHnswQueryHint &clawdb_get_thread_query_hint() {
+  return tl_hnsw_query_hint;
+}
+
+void clawdb_clear_thread_query_hint() {
+  tl_hnsw_query_hint.active = false;
+  tl_hnsw_query_hint.query_vec = ClawdbVector();
+  tl_hnsw_query_hint.metric = ClawdbDistanceMetric::L2;
+  tl_hnsw_query_hint.top_k = 0;
+}
+
 /* MYSQL_ERRMSG_SIZE is defined in mysql_com.h (512 bytes).
    We include it via the public header path. */
 #ifndef MYSQL_ERRMSG_SIZE
@@ -104,6 +121,35 @@ bool vector_distance_init(UDF_INIT *initid, UDF_ARGS *args, char *message) {
   initid->maybe_null = true;
   initid->decimals = 6;
   initid->max_length = 20;
+
+  /* Set the thread-local HNSW query hint so that ha_clawdb::rnd_init()
+     can use the HNSW index for accelerated scanning.  We parse the query
+     vector here (during init) because the query string is available as a
+     constant at this point for most queries. */
+  if (args->args[1] != nullptr && args->lengths[1] > 0) {
+    ClawdbHnswQueryHint &hint = clawdb_get_thread_query_hint();
+    std::string query_str(args->args[1], args->lengths[1]);
+    std::string errmsg;
+    ClawdbVector parsed_vec;
+    if (clawdb_parse_vector_string(query_str.c_str(), &parsed_vec, &errmsg)) {
+      hint.query_vec = parsed_vec;
+      hint.active = true;
+      hint.metric = ClawdbDistanceMetric::L2;
+
+      /* Parse metric if provided. */
+      if (args->arg_count == 3 && args->args[2] != nullptr &&
+          args->lengths[2] > 0) {
+        std::string metric_name(args->args[2], args->lengths[2]);
+        for (char &ch : metric_name) {
+          if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch + 32);
+        }
+        if (metric_name == "cosine") {
+          hint.metric = ClawdbDistanceMetric::COSINE;
+        }
+      }
+    }
+  }
+
   return false;  /* success */
 }
 

@@ -23,6 +23,8 @@ ADD_DEFINITIONS(-DMYSQL_SERVER)
 
 SET(CLAWDB_SOURCES
   ha_clawdb.cc
+  clawdb_share.cc
+  clawdb_serde.cc
   clawdb_vec.cc
   clawdb_store.cc
   clawdb_hnsw.cc

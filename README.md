@@ -31,7 +31,8 @@ all without any modification to the MySQL server source code.
 | Max dimensions | 16 000 (aligned with PGVector `VECTOR_MAX_DIM`) |
 | Distance metrics | L2 squared distance, Cosine distance |
 | KNN search | Brute-force full-scan via `ORDER BY vector_distance() LIMIT N` |
-| HNSW index | In-memory HNSW (M=16, ef_construction=64, ef_search=40) |
+| HNSW index | In-memory HNSW with customizable parameters via `CREATE INDEX ... COMMENT` |
+| Vector index creation | `CREATE INDEX ... COMMENT 'HNSW(metric=cosine, m=32, ...)'` syntax |
 | SQL functions | `vector_distance()`, `clawdb_to_vector()`, `clawdb_from_vector()` |
 | Multi-version support | Single codebase for MySQL 5.7 / 8.0 / 8.4 |
 | Zero server changes | Pure plugin — `INSTALL PLUGIN` is all you need |
@@ -113,7 +114,48 @@ CREATE TABLE vec_tbl (
 ) ENGINE=CLAWDB;
 ```
 
-### 4. Insert Vectors
+### 4. Create a Vector Index (Optional)
+
+ClawDB supports creating an HNSW (Hierarchical Navigable Small World) index
+on the vector column to customize the approximate nearest-neighbor search
+behavior.  The index parameters are passed via the standard `COMMENT` clause:
+
+```sql
+-- Create an HNSW index with custom parameters
+CREATE INDEX vec_idx ON vec_tbl (embedding(768))
+  COMMENT 'HNSW(metric=cosine, m=32, ef_construction=200, ef_search=100)';
+```
+
+**Syntax:** `HNSW([key=value, ...])`
+
+| Parameter | Default | Range | Description |
+|---|---|---|---|
+| `metric` | `l2` | `l2`, `euclidean`, `cosine` | Distance metric |
+| `m` | 16 | [2, 100] | Max connections per node |
+| `ef_construction` | 64 | [4, 1000] | Build-time search width |
+| `ef_search` | 40 | [1, 1000] | Query-time search width |
+
+All parameters are optional.  If no `COMMENT` is specified, HNSW defaults
+are used.  The prefix length (e.g. `768`) is required by MySQL for BLOB
+indexes but is ignored by ClawDB — the full vector is always indexed.
+
+```sql
+-- Minimal form: HNSW index with all defaults (L2 metric)
+CREATE INDEX vec_idx ON vec_tbl (embedding(768));
+
+-- Inline index in CREATE TABLE
+CREATE TABLE vec_tbl (
+  id        INT          NOT NULL PRIMARY KEY,
+  embedding BLOB         NOT NULL COMMENT 'VECTOR(128)',
+  INDEX vec_idx (embedding(512)) COMMENT 'HNSW(metric=cosine)'
+) ENGINE=CLAWDB;
+```
+
+> **Note:** Only one vector index per table is supported.  The index is
+> persisted to a `.hnsw` binary file and loaded on table open (rebuilt from
+> the data file if the index file is missing or stale).
+
+### 5. Insert Vectors
 
 ```sql
 -- Use clawdb_to_vector() to convert the string representation to binary BLOB
@@ -123,7 +165,7 @@ INSERT INTO vec_tbl VALUES
   (3, 'bird', clawdb_to_vector('[0.7, 0.8, 0.9, ...]'));
 ```
 
-### 5. KNN Search
+### 6. KNN Search
 
 ```sql
 -- Find the 5 nearest neighbors by L2 distance (default)
@@ -141,7 +183,7 @@ ORDER BY dist
 LIMIT 5;
 ```
 
-### 6. Read Back Vectors as Strings
+### 7. Read Back Vectors as Strings
 
 ```sql
 SELECT id, clawdb_from_vector(embedding) AS vec_str FROM vec_tbl;
@@ -196,14 +238,25 @@ MySQL SQL Layer
       │
       ▼
 ha_clawdb (handler)          ← storage/clawdb/ha_clawdb.{h,cc}
+      │                        Handler lifecycle, DML, scan, KNN dispatch
+      │
+      ├── ClawdbShare        ← clawdb_share.{h,cc}
+      │     Global share cache (one per table path)
+      │     HNSW COMMENT parser (metric, m, ef_construction, ef_search)
+      │
+      ├── Row Serde          ← clawdb_serde.{h,cc}
+      │     serialize_row / deserialize_row (MySQL record ↔ byte stream)
+      │     BLOB field helpers, vector extraction
       │
       ├── ClawdbTableStore   ← clawdb_store.{h,cc}
       │     Flat file: <db>/<table>.clawdb
       │     Layout: [FileHeader][RowHeader+RowData] ...
+      │     Large-file safe (fseeko/ftello)
       │
       ├── ClawdbHnswIndex    ← clawdb_hnsw.{h,cc}
-      │     In-memory HNSW graph (rebuilt on open)
+      │     In-memory HNSW graph with binary persistence (.hnsw file)
       │     Ported from PGVector, pure C++ STL
+      │     RAII resource management (FileGuard)
       │
       ├── ClawdbVector       ← clawdb_vec.{h,cc}
       │     Parse/serialize '[f0,f1,...]' ↔ binary blob
@@ -216,6 +269,7 @@ ha_clawdb (handler)          ← storage/clawdb/ha_clawdb.{h,cc}
       │
       └── Compat Layer       ← clawdb_compat.h
             Centralizes all #if MYSQL_VERSION_ID conditionals
+            (incl. down_cast<> fallback for 5.7)
             so the rest of the code is version-agnostic
 ```
 
@@ -237,17 +291,35 @@ Per row:
 
 ### HNSW Index
 
-The HNSW index is rebuilt from the data file on every `open()`.  It lives
-entirely in memory and is updated incrementally on `write_row()`,
-`update_row()`, and `delete_row()`.
+The HNSW index is persisted to a binary `.hnsw` file alongside the data file.
+On `open()`, ClawDB first attempts to load the persisted index; if the file
+is missing or invalid, the index is rebuilt by scanning the data file.  The
+index is updated incrementally on `write_row()`, `update_row()`, and
+`delete_row()`, and saved back to disk when the last handler closes (if dirty)
+or after a full rebuild.
 
-Parameters (aligned with PGVector defaults):
+**Persistence format** (native byte order):
 
-| Parameter | Value |
-|---|---|
-| M | 16 |
-| ef_construction | 64 |
-| ef_search | 40 |
+```
+[HnswFileHeader 40 bytes]
+For each node:
+  [uint64  node_id]
+  [int32   level]
+  [uint32  vector_dim]
+  [float × dim]                  (vector data)
+  For each layer 0..level:
+    [uint32  neighbor_count]
+    [uint64 × neighbor_count]    (neighbor node_ids)
+```
+
+Default parameters (aligned with PGVector defaults):
+
+| Parameter | Default | Customizable via |
+|---|---|---|
+| M | 16 | `CREATE INDEX ... COMMENT 'HNSW(m=32)'` |
+| ef_construction | 64 | `CREATE INDEX ... COMMENT 'HNSW(ef_construction=200)'` |
+| ef_search | 40 | `CREATE INDEX ... COMMENT 'HNSW(ef_search=100)'` |
+| metric | L2 | `CREATE INDEX ... COMMENT 'HNSW(metric=cosine)'` |
 
 ---
 
@@ -256,7 +328,7 @@ Parameters (aligned with PGVector defaults):
 ### clawdb_test.sql
 
 A comprehensive SQL functional test suite located at `test/clawdb_test.sql`.
-It covers 13 test sections:
+It covers 14 test sections:
 
 | # | Test Section | What It Verifies |
 |---|---|---|
@@ -269,10 +341,11 @@ It covers 13 test sections:
 | 7 | DELETE | Remove rows, verify count and remaining IDs |
 | 8 | KNN after mutations | Correct ordering after UPDATE + DELETE |
 | 9 | NULL handling | NULL vector column, NULL distance result |
-| 10 | Large dimensions | 128-dim vectors, distance correctness |
-| 11 | TRUNCATE | `delete_all_rows()` path |
-| 12 | DROP TABLE | Clean removal of table and data file |
-| 13 | Cleanup | Drop test database |
+| 10 | Vector index creation | `CREATE INDEX ... COMMENT 'HNSW(...)'` with custom params |
+| 11 | Large dimensions | 128-dim vectors, distance correctness |
+| 12 | TRUNCATE | `delete_all_rows()` path |
+| 13 | DROP TABLE | Clean removal of table and data file |
+| 14 | Cleanup | Drop test database |
 
 **Running the test:**
 
@@ -312,6 +385,7 @@ Key differences handled by the compat layer:
 | Handler factory | 3 params | 4 params (+ `partitioned`) |
 | UDF registration | Manual `CREATE FUNCTION` | Component registry service |
 | `file_extensions` | Not present | Required on handlerton |
+| `down_cast<>` | Fallback via `static_cast` | Provided by `my_dbug.h` |
 | Plugin descriptor | No "Check Uninstall" slot | Has "Check Uninstall" slot |
 
 ---
@@ -324,7 +398,8 @@ Key differences handled by the compat layer:
 | HNSW in-memory index | ✅ Implemented |
 | L2 + cosine distance | ✅ Implemented |
 | Brute-force KNN scan | ✅ Implemented |
-| Persistent HNSW index | 🔲 Planned (serialize graph to file) |
+| Customizable HNSW parameters | ✅ Implemented (`CREATE INDEX ... COMMENT 'HNSW(...)'`) |
+| Persistent HNSW index (.hnsw file) | ✅ Implemented |
 | IVFFlat index | 🔲 Planned |
 | Concurrent write safety | 🔲 Planned (per-table mutex) |
 | SIMD distance acceleration | 🔲 Planned |
